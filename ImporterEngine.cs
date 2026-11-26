@@ -349,29 +349,24 @@ namespace ShaiyaItemImporter
 
                 if (dryRun)
                 {
-                    Log("[DRY-RUN] Amostra de Model/Icon dos 5 primeiros itens:");
-                    foreach (var sample in distinctItems.Take(5))
-                    {
-                        Log($"   [{sample.Type:D3}:{sample.TypeId:D3}] {sample.DonorName} -> Model={sample.Model} | Icon={sample.Icon}");
-                    }
-
-                    var sampleItemFiles = DonorData.FileIndex.Values
-                        .Select(f => NormalizeRelPath(f.RelativePath))
-                        .Where(p => p.StartsWith("Item/3DO/", StringComparison.OrdinalIgnoreCase))
-                        .Take(5);
-                    Log("[DRY-RUN] Exemplos em Item/3DO/: " + string.Join(", ", sampleItemFiles));
-
-                    var sampleInterfaceFiles = DonorData.FileIndex.Values
-                        .Select(f => NormalizeRelPath(f.RelativePath))
-                        .Where(p => p.StartsWith("Interface/", StringComparison.OrdinalIgnoreCase) && p.EndsWith(".dds", StringComparison.OrdinalIgnoreCase))
-                        .Take(8);
-                    Log("[DRY-RUN] Exemplos em Interface/: " + string.Join(", ", sampleInterfaceFiles));
-
                     var previewFiles = CollectRequiredAssetFiles(DonorData, TargetData, distinctItems, copyAssets, copyIcons);
                     int modelsCount = previewFiles.Count(f => f.Name.EndsWith(".3do", StringComparison.OrdinalIgnoreCase) || f.Name.EndsWith(".3dc", StringComparison.OrdinalIgnoreCase));
                     int iconsCount = previewFiles.Count(f => NormalizeRelPath(f.RelativePath).StartsWith("Interface/", StringComparison.OrdinalIgnoreCase));
                     int texCount = previewFiles.Count - modelsCount - iconsCount;
                     Log($"[DRY-RUN] Arquivos visuais detectados: {previewFiles.Count} total ({modelsCount} modelos 3D, {texCount} texturas DDS/TGA, {iconsCount} folhas de ícones).");
+
+                    var sampleModels = previewFiles
+                        .Where(f => f.Name.EndsWith(".3do", StringComparison.OrdinalIgnoreCase) || f.Name.EndsWith(".3dc", StringComparison.OrdinalIgnoreCase))
+                        .Select(f => NormalizeRelPath(f.RelativePath))
+                        .Take(6);
+                    Log("[DRY-RUN] Amostra de modelos 3D: " + string.Join(", ", sampleModels));
+
+                    var sampleIcons = previewFiles
+                        .Where(f => NormalizeRelPath(f.RelativePath).StartsWith("Interface/", StringComparison.OrdinalIgnoreCase))
+                        .Select(f => NormalizeRelPath(f.RelativePath))
+                        .Take(6);
+                    Log("[DRY-RUN] Amostra de ícones: " + string.Join(", ", sampleIcons));
+
                     return totalCount;
                 }
 
@@ -666,11 +661,11 @@ namespace ShaiyaItemImporter
                     int model = itm.Model;
                     byte type = itm.Type;
 
-                    // 1. Armas, escudos e itens em Item/3DO e Item/DDS (suporta 01_145, 01_0145, etc.)
+                    // 1. Armas e escudos (suporta 01_077.3DO, 01_L_077.3DO, 01_F_077.3DO, etc.)
                     if (WeaponAndShieldTypes.Contains(type) || (!ArmorAndCostumeTypes.Contains(type) && type != 120 && type != 121 && model > 0))
                     {
                         var itemAssetRegex = new Regex(
-                            $@"^(?:[a-z]+_)?(?:0*{type})_(?:0*{model})(?:_[^.]+)?\.(?:3do|3dc|dds|tga)$",
+                            $@"^(?:[a-z]+_)?0*{type}_(?:[a-z]_)?0*{model}(?:_[^.]+)?\.(?:3do|3dc|dds|tga)$",
                             RegexOptions.IgnoreCase);
 
                         var weaponModels = allDonorFiles.Where(e =>
@@ -728,7 +723,7 @@ namespace ShaiyaItemImporter
                         if (armorMeshes.Count == 0)
                         {
                             var helmItemRegex = new Regex(
-                                $@"^(?:[a-z]+_)?(?:0*{type})_(?:0*{model})(?:_[^.]+)?\.(?:3do|3dc|dds|tga)$",
+                                $@"^(?:[a-z]+_)?0*{type}_(?:[a-z]_)?0*{model}(?:_[^.]+)?\.(?:3do|3dc|dds|tga)$",
                                 RegexOptions.IgnoreCase);
                             foreach (var hm in allDonorFiles.Where(e =>
                                 e.NormPath.StartsWith("Item/", StringComparison.OrdinalIgnoreCase) &&
@@ -790,15 +785,22 @@ namespace ShaiyaItemImporter
                 {
                     if (itm.Icon > 0)
                     {
+                        // Shaiya usa Icon diretamente como número da folha (ex.: Icon=19 -> interface/icon/19.dds)
+                        // e também suporta índice linear (Icon / 256)
+                        requiredSheetNumbers.Add(itm.Icon);
                         int zeroBased = itm.Icon / 256;
-                        requiredSheetNumbers.Add(zeroBased);
-                        requiredSheetNumbers.Add(zeroBased + 1);
+                        if (zeroBased > 0)
+                        {
+                            requiredSheetNumbers.Add(zeroBased);
+                            requiredSheetNumbers.Add(zeroBased + 1);
+                        }
                     }
                 }
 
                 var donorIconFiles = allDonorFiles
-                    .Where(e => e.NormPath.StartsWith("Interface/", StringComparison.OrdinalIgnoreCase) &&
-                                e.File.Name.Contains("icon", StringComparison.OrdinalIgnoreCase) &&
+                    .Where(e => (e.NormPath.StartsWith("interface/icon/", StringComparison.OrdinalIgnoreCase) ||
+                                 (e.NormPath.StartsWith("interface/", StringComparison.OrdinalIgnoreCase) &&
+                                  e.File.Name.Contains("icon", StringComparison.OrdinalIgnoreCase))) &&
                                 e.File.Name.EndsWith(".dds", StringComparison.OrdinalIgnoreCase))
                     .ToList();
 
@@ -826,7 +828,7 @@ namespace ShaiyaItemImporter
             bool copyIcons,
             string patchTempDir)
         {
-            Log("Analisando modelos 3D (.3DO/.3DC), texturas (.DDS) e folhas de ícones (Interface/*icon*.dds)...");
+            Log("Analisando modelos 3D (.3DO/.3DC), texturas (.DDS) e folhas de ícones (interface/icon/*.dds)...");
 
             var filesToExtract = CollectRequiredAssetFiles(donorData, targetData, selectedItems, copyAssets, copyIcons);
             int modelsCount = 0;
