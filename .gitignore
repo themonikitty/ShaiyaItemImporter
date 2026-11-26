@@ -1,0 +1,13 @@
+*.saf
+*.sah
+*.SData
+*.bak*
+*.exe
+*.dll
+__pycache__/
+.venv/
+venv/
+bin/
+obj/
+Output/
+.vs/
