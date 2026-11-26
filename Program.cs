@@ -29,8 +29,6 @@ namespace ShaiyaItemImporter
             return 0;
         }
 
-        // ... mantenha o restante do Program.cs exatamente como está
-
         static async Task<int> RunSilentAsync(string[] args)
         {
             Console.WriteLine("============================================");
@@ -45,6 +43,7 @@ namespace ShaiyaItemImporter
             bool autoSelectNew = args.Contains("--auto") || itemsArg == null;
             bool forceHigherTypes = args.Contains("--force-type");
             bool copyIcons = !args.Contains("--no-icons");
+            bool dryRun = args.Contains("--dry-run");
 
             if (string.IsNullOrEmpty(donor) || !File.Exists(donor))
             {
@@ -79,7 +78,7 @@ namespace ShaiyaItemImporter
                 {
                     engine.SelectNewAndNonDuplicate(true);
                     selected = engine.LoadedEntries.Where(e => e.IsSelected).ToList();
-                    Console.WriteLine($"Modo automático: {selected.Count} itens compatíveis selecionados.");
+                    Console.WriteLine($"Modo automático: {selected.Count} itens válidos e compatíveis selecionados.");
                 }
                 else
                 {
@@ -118,12 +117,12 @@ namespace ShaiyaItemImporter
 
                 Console.WriteLine();
                 Console.WriteLine("Itens a importar:");
-                foreach (var item in selected.Take(20))
+                foreach (var item in selected.Take(25))
                 {
                     Console.WriteLine($"  [{item.Type:D3}:{item.TypeId:D3}] {item.DonorName,-30} ({item.StatusDisplay})");
                 }
-                if (selected.Count > 20)
-                    Console.WriteLine($"  ... e mais {selected.Count - 20} itens.");
+                if (selected.Count > 25)
+                    Console.WriteLine($"  ... e mais {selected.Count - 25} itens.");
                 Console.WriteLine();
 
                 string sqlBackupPath = backupPath ?? Path.Combine(
@@ -139,11 +138,15 @@ namespace ShaiyaItemImporter
                     updateSql: true,
                     sqlConnectionString: sql,
                     generateSqlBackup: true,
-                    backupSqlPath: sqlBackupPath);
+                    backupSqlPath: sqlBackupPath,
+                    dryRun: dryRun);
 
                 Console.WriteLine();
-                Console.WriteLine($"✅ Importação concluída! {imported} itens processados.");
-                Console.WriteLine($"   Backup SQL: {sqlBackupPath}");
+                Console.WriteLine(dryRun
+                    ? $"✅ Simulação concluída! {imported} itens prontos para importação."
+                    : $"✅ Importação concluída! {imported} itens processados.");
+                if (!dryRun)
+                    Console.WriteLine($"   Backup SQL: {sqlBackupPath}");
                 return 0;
             }
             catch (Exception ex)

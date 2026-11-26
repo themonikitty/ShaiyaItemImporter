@@ -29,17 +29,38 @@ namespace ShaiyaItemImporter
         public List<ItemEntry> LoadedEntries { get; private set; } = new();
 
         private static readonly HashSet<byte> CashItemTypes = new() { 90, 91, 92, 93, 95, 100, 101, 102, 120, 121, 150 };
-        private static readonly HashSet<byte> ArmorAndCostumeTypes = new() { 16, 17, 18, 20, 21, 22, 23, 24, 26, 27, 90, 91, 92, 93, 150 };
-        private static readonly HashSet<byte> WeaponAndShieldTypes = new() { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 19, 25 };
+
+        // Inclui armaduras padrão (16-27) e faixas de sets/elmos/fantasias EP6/EP8 (36-41, 51-56, 67-77, 90-93, 150)
+        private static readonly HashSet<byte> ArmorAndCostumeTypes = new()
+        {
+            16, 17, 18, 20, 21, 22, 23, 24, 26, 27,
+            36, 37, 38, 40, 41,
+            51, 52, 53, 55, 56,
+            67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77,
+            90, 91, 92, 93, 150
+        };
+
+        private static readonly HashSet<byte> WeaponAndShieldTypes = new()
+        {
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 19, 25,
+            45, 46, 47, 48, 49, 50, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66
+        };
 
         private static readonly Regex EmbeddedTextureRegex = new(
             @"([a-zA-Z0-9_\-\.]+\.(?:dds|tga))",
             RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
+        private static readonly Regex ValidLetterRegex = new(
+            @"[A-Za-zÀ-ÿ]{2,}",
+            RegexOptions.Compiled);
+
         public event Action<string>? OnLog;
         public event Action<int, int>? OnProgress;
 
         private void Log(string msg) => OnLog?.Invoke(msg);
+
+        private static string NormalizeRelPath(string path) =>
+            path.Replace('\\', '/').TrimStart('/');
 
         public async Task LoadClientsAsync(string donorSahPath, string targetSahPath, bool allowHigherTypes = false)
         {
@@ -149,7 +170,6 @@ namespace ShaiyaItemImporter
                 }
             }
 
-            // Deduplicar itens do doador por (Type, TypeId), priorizando definições válidas
             var uniqueDonorDefs = new Dictionary<string, ItemDefinition>(StringComparer.Ordinal);
             int skippedDuplicates = 0;
 
@@ -187,7 +207,7 @@ namespace ShaiyaItemImporter
                 targetDict.TryGetValue(kv.Key, out var coreDef);
 
                 bool isDonorEmpty = IsDonorItemEmptyOrDummy(donorDef);
-                bool isCorePlaceholder = coreDef == null || string.IsNullOrWhiteSpace(coreDef.Name) || coreDef.Name.StartsWith("???") || coreDef.Name.Contains("??");
+                bool isCorePlaceholder = coreDef == null || string.IsNullOrWhiteSpace(coreDef.Name) || coreDef.Name.StartsWith("?") || coreDef.Name.Contains("??");
 
                 ItemImportStatus status;
                 if (isDonorEmpty)
@@ -232,12 +252,17 @@ namespace ShaiyaItemImporter
 
         private static bool IsDonorItemEmptyOrDummy(ItemDefinition d)
         {
-            string name = (d.Name ?? "").Trim();
+            string name = (d.Name ?? "").Replace("\0", "").Trim();
 
             if (string.IsNullOrWhiteSpace(name) || name.Length < 2)
                 return true;
 
-            if (Regex.IsMatch(name, @"^[\?\*\-_\.\s]+$"))
+            // Filtra strings coreanas corrompidas (ex.: "???253", "? ?? ??? 6", "13 B ?? ???")
+            if (name.Contains("??") || name.StartsWith("?"))
+                return true;
+
+            // Exige ao menos uma palavra válida com 2+ letras
+            if (!ValidLetterRegex.IsMatch(name))
                 return true;
 
             if (name.Equals("none", StringComparison.OrdinalIgnoreCase) ||
@@ -257,10 +282,12 @@ namespace ShaiyaItemImporter
             if (d.Icon == 0 && d.Model == 0)
                 return true;
 
-            if (d.ItemType >= 1 && d.ItemType <= 27)
+            // Filtra armas, armaduras, elmos e fantasias sem nenhum status ou atributo configurado
+            bool isEquipment = WeaponAndShieldTypes.Contains(d.ItemType) || ArmorAndCostumeTypes.Contains(d.ItemType);
+            if (isEquipment)
             {
                 bool hasAnyCombatOrStat = d.Attack > 0 || d.AttackAdd > 0 || d.Def > 0 || d.Resist > 0 ||
-                                          d.Quality > 0 || d.Slot > 0 ||
+                                          d.Quality > 0 || d.Slot > 0 || d.Speed > 0 ||
                                           d.Hp > 0 || d.Sp > 0 || d.Mp > 0 ||
                                           d.Str > 0 || d.Dex > 0 || d.Rec > 0 || d.Int > 0 || d.Wis > 0 || d.Luc > 0;
                 if (!hasAnyCombatOrStat)
@@ -291,6 +318,13 @@ namespace ShaiyaItemImporter
             }
         }
 
+        public int PreviewRequiredAssetsCount(List<ItemEntry> selectedItems, bool copyAssets, bool copyIcons)
+        {
+            if (DonorData == null || TargetData == null) return 0;
+            var plan = CollectRequiredAssetFiles(DonorData, TargetData, selectedItems, copyAssets, copyIcons);
+            return plan.Count;
+        }
+
         public async Task<int> ExecuteImportAsync(
             List<ItemEntry> selectedItems,
             string targetSahPath,
@@ -300,14 +334,14 @@ namespace ShaiyaItemImporter
             bool updateSql,
             string sqlConnectionString,
             bool generateSqlBackup,
-            string backupSqlPath)
+            string backupSqlPath,
+            bool dryRun = false)
         {
             return await Task.Run(() =>
             {
                 if (TargetData == null || TargetItem == null || DonorData == null)
                     throw new InvalidOperationException("Clientes não carregados.");
 
-                // Garantir lista única sem duplicidade de (Type, TypeId) ou ItemId
                 var distinctItems = selectedItems
                     .Where(i => i.Type > 0 && i.TypeId > 0)
                     .GroupBy(i => (i.Type, i.TypeId))
@@ -317,7 +351,17 @@ namespace ShaiyaItemImporter
                     .ToList();
 
                 int totalCount = distinctItems.Count;
-                Log($"Iniciando importação de {totalCount} itens únicos selecionados...");
+                Log($"{(dryRun ? "[SIMULAÇÃO DRY-RUN] " : "")}Iniciando importação de {totalCount} itens únicos selecionados...");
+
+                if (dryRun)
+                {
+                    var previewFiles = CollectRequiredAssetFiles(DonorData, TargetData, distinctItems, copyAssets, copyIcons);
+                    int modelsCount = previewFiles.Count(f => f.Name.EndsWith(".3do", StringComparison.OrdinalIgnoreCase) || f.Name.EndsWith(".3dc", StringComparison.OrdinalIgnoreCase));
+                    int iconsCount = previewFiles.Count(f => NormalizeRelPath(f.RelativePath).StartsWith("Interface/", StringComparison.OrdinalIgnoreCase));
+                    int texCount = previewFiles.Count - modelsCount - iconsCount;
+                    Log($"[DRY-RUN] Arquivos visuais detectados: {previewFiles.Count} total ({modelsCount} modelos 3D, {texCount} texturas DDS/TGA, {iconsCount} folhas de ícones).");
+                    return totalCount;
+                }
 
                 string tempDir = Path.Combine(Path.GetTempPath(), "ShaiyaImport_" + Guid.NewGuid().ToString("N"));
                 string patchTempDir = Path.Combine(tempDir, "patch_in");
@@ -334,15 +378,19 @@ namespace ShaiyaItemImporter
                     {
                         Log($"Atualizando catálogo do cliente (Item.SData - Formato {TargetEpisode})...");
 
-                        // Backup do Item.SData original antes da modificação
                         var origSFile = TargetData.GetFile("Item/Item.SData");
                         if (origSFile != null)
                         {
-                            string sdataBak = Path.Combine(
-                                Path.GetDirectoryName(targetSahPath) ?? "",
-                                $"Item.SData.bak_{DateTime.Now:yyyyMMdd_HHmmss}");
-                            File.WriteAllBytes(sdataBak, TargetData.GetFileBuffer(origSFile));
-                            Log($"Backup do Item.SData original salvo em: {Path.GetFileName(sdataBak)}");
+                            string targetDir = Path.GetDirectoryName(targetSahPath) ?? "";
+                            byte[] origBytes = TargetData.GetFileBuffer(origSFile);
+
+                            string origBaselineSData = Path.Combine(targetDir, "Item.SData.bak_ORIGINAL");
+                            if (!File.Exists(origBaselineSData))
+                                File.WriteAllBytes(origBaselineSData, origBytes);
+
+                            string sdataBak = Path.Combine(targetDir, $"Item.SData.bak_{DateTime.Now:yyyyMMdd_HHmmss}");
+                            File.WriteAllBytes(sdataBak, origBytes);
+                            Log($"Backup do Item.SData salvo em: {Path.GetFileName(sdataBak)}");
                         }
 
                         foreach (var entry in distinctItems)
@@ -356,7 +404,6 @@ namespace ShaiyaItemImporter
                             }
 
                             var group = TargetItem.ItemGroups[type];
-                            // Remover eventuais duplicatas antigas do mesmo TypeId no grupo
                             var existingDefs = group.ItemDefinitions.Where(d => d.ItemTypeId == typeId).ToList();
                             if (existingDefs.Count > 1)
                             {
@@ -413,6 +460,10 @@ namespace ShaiyaItemImporter
                     string[] patchFiles = Directory.GetFiles(patchTempDir, "*", SearchOption.AllDirectories);
                     if (patchFiles.Length > 0)
                     {
+                        string origBaselineSah = $"{targetSahPath}.bak_ORIGINAL";
+                        if (!File.Exists(origBaselineSah))
+                            File.Copy(targetSahPath, origBaselineSah, overwrite: false);
+
                         string sahBackupPath = $"{targetSahPath}.bak_{DateTime.Now:yyyyMMdd_HHmmss}";
                         File.Copy(targetSahPath, sahBackupPath, overwrite: true);
                         Log($"Backup de segurança do data.sah salvo em: {Path.GetFileName(sahBackupPath)}");
@@ -534,38 +585,41 @@ namespace ShaiyaItemImporter
             return clean.Length <= maxLen ? clean : clean.Substring(0, maxLen);
         }
 
-        private int ExtractAllRequiredAssets(
+        private List<SFile> CollectRequiredAssetFiles(
             Data donorData,
             Data targetData,
             List<ItemEntry> selectedItems,
             bool copyAssets,
-            bool copyIcons,
-            string patchTempDir)
+            bool copyIcons)
         {
-            var extractedPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var collected = new Dictionary<string, SFile>(StringComparer.OrdinalIgnoreCase);
 
-            var donorTexturesByFileName = new Dictionary<string, List<SFile>>(StringComparer.OrdinalIgnoreCase);
-            foreach (var f in donorData.FileIndex.Values)
+            var targetNormalizedPaths = new HashSet<string>(
+                targetData.FileIndex.Values.Select(f => NormalizeRelPath(f.RelativePath)),
+                StringComparer.OrdinalIgnoreCase);
+
+            var allDonorFiles = donorData.FileIndex.Values
+                .Select(f => (File: f, NormPath: NormalizeRelPath(f.RelativePath)))
+                .ToList();
+
+            var donorTexturesByFileName = new Dictionary<string, List<(SFile File, string NormPath)>>(StringComparer.OrdinalIgnoreCase);
+            foreach (var entry in allDonorFiles)
             {
-                if (f.Name.EndsWith(".dds", StringComparison.OrdinalIgnoreCase) ||
-                    f.Name.EndsWith(".tga", StringComparison.OrdinalIgnoreCase))
+                if (entry.File.Name.EndsWith(".dds", StringComparison.OrdinalIgnoreCase) ||
+                    entry.File.Name.EndsWith(".tga", StringComparison.OrdinalIgnoreCase))
                 {
-                    if (!donorTexturesByFileName.TryGetValue(f.Name, out var list))
+                    if (!donorTexturesByFileName.TryGetValue(entry.File.Name, out var list))
                     {
-                        list = new List<SFile>();
-                        donorTexturesByFileName[f.Name] = list;
+                        list = new List<(SFile, string)>();
+                        donorTexturesByFileName[entry.File.Name] = list;
                     }
-                    list.Add(f);
+                    list.Add(entry);
                 }
             }
 
-            void CopyFileWithTextures(SFile sfile, string? preferredTextureFolder = null)
+            void AddFileWithTextures(SFile sfile, string normPath, string? preferredTextureFolder = null)
             {
-                if (!extractedPaths.Contains(sfile.RelativePath))
-                {
-                    ExtractFileToPatch(donorData, sfile, patchTempDir);
-                    extractedPaths.Add(sfile.RelativePath);
-                }
+                collected.TryAdd(normPath, sfile);
 
                 if (sfile.Name.EndsWith(".3do", StringComparison.OrdinalIgnoreCase) ||
                     sfile.Name.EndsWith(".3dc", StringComparison.OrdinalIgnoreCase))
@@ -577,20 +631,16 @@ namespace ShaiyaItemImporter
                     {
                         if (donorTexturesByFileName.TryGetValue(texName, out var matchingTexFiles))
                         {
-                            foreach (var texFile in matchingTexFiles)
+                            foreach (var texEntry in matchingTexFiles)
                             {
                                 if (preferredTextureFolder != null &&
                                     matchingTexFiles.Count > 1 &&
-                                    !texFile.RelativePath.StartsWith(preferredTextureFolder, StringComparison.OrdinalIgnoreCase))
+                                    !texEntry.NormPath.StartsWith(preferredTextureFolder, StringComparison.OrdinalIgnoreCase))
                                 {
                                     continue;
                                 }
 
-                                if (!extractedPaths.Contains(texFile.RelativePath))
-                                {
-                                    ExtractFileToPatch(donorData, texFile, patchTempDir);
-                                    extractedPaths.Add(texFile.RelativePath);
-                                }
+                                collected.TryAdd(texEntry.NormPath, texEntry.File);
                             }
                         }
                     }
@@ -599,113 +649,125 @@ namespace ShaiyaItemImporter
 
             if (copyAssets)
             {
-                Log("Analisando modelos 3D (.3DO/.3DC) e texturas (.DDS) de armas, escudos, roupas e asas...");
-
-                var allDonorFiles = donorData.FileIndex.Values.ToList();
-
                 foreach (var itm in selectedItems)
                 {
                     int model = itm.Model;
                     byte type = itm.Type;
 
+                    // 1. Armas, escudos e itens em Item/3DO e Item/DDS
                     if (WeaponAndShieldTypes.Contains(type) || (!ArmorAndCostumeTypes.Contains(type) && type != 120 && type != 121 && model > 0))
                     {
                         string modelPrefix3 = $"{type:D2}_{model:D3}";
                         string modelPrefix2 = $"{type:D2}_{model:D2}";
 
-                        var weaponModels = allDonorFiles.Where(f =>
-                            f.RelativePath.StartsWith("Item/3DO/", StringComparison.OrdinalIgnoreCase) &&
-                            (f.Name.StartsWith(modelPrefix3, StringComparison.OrdinalIgnoreCase) ||
-                             (model < 100 && f.Name.StartsWith(modelPrefix2 + ".", StringComparison.OrdinalIgnoreCase)) ||
-                             (model < 100 && f.Name.StartsWith(modelPrefix2 + "_", StringComparison.OrdinalIgnoreCase))))
+                        var weaponModels = allDonorFiles.Where(e =>
+                            e.NormPath.StartsWith("Item/3DO/", StringComparison.OrdinalIgnoreCase) &&
+                            (e.File.Name.StartsWith(modelPrefix3, StringComparison.OrdinalIgnoreCase) ||
+                             (model < 100 && e.File.Name.StartsWith(modelPrefix2 + ".", StringComparison.OrdinalIgnoreCase)) ||
+                             (model < 100 && e.File.Name.StartsWith(modelPrefix2 + "_", StringComparison.OrdinalIgnoreCase))))
                             .ToList();
 
                         foreach (var wm in weaponModels)
                         {
-                            CopyFileWithTextures(wm, "Item/");
+                            AddFileWithTextures(wm.File, wm.NormPath, "Item/");
                         }
 
-                        var weaponTextures = allDonorFiles.Where(f =>
-                            (f.RelativePath.StartsWith("Item/DDS/", StringComparison.OrdinalIgnoreCase) ||
-                             f.RelativePath.StartsWith("Item/Texture/", StringComparison.OrdinalIgnoreCase)) &&
-                            (f.Name.StartsWith(modelPrefix3, StringComparison.OrdinalIgnoreCase) ||
-                             (model < 100 && f.Name.StartsWith(modelPrefix2 + ".", StringComparison.OrdinalIgnoreCase)) ||
-                             (model < 100 && f.Name.StartsWith(modelPrefix2 + "_", StringComparison.OrdinalIgnoreCase))))
+                        var weaponTextures = allDonorFiles.Where(e =>
+                            (e.NormPath.StartsWith("Item/DDS/", StringComparison.OrdinalIgnoreCase) ||
+                             e.NormPath.StartsWith("Item/Texture/", StringComparison.OrdinalIgnoreCase)) &&
+                            (e.File.Name.StartsWith(modelPrefix3, StringComparison.OrdinalIgnoreCase) ||
+                             (model < 100 && e.File.Name.StartsWith(modelPrefix2 + ".", StringComparison.OrdinalIgnoreCase)) ||
+                             (model < 100 && e.File.Name.StartsWith(modelPrefix2 + "_", StringComparison.OrdinalIgnoreCase))))
                             .ToList();
 
                         foreach (var wt in weaponTextures)
                         {
-                            CopyFileWithTextures(wt);
+                            AddFileWithTextures(wt.File, wt.NormPath);
                         }
                     }
 
+                    // 2. Armaduras, elmos, roupas e fantasias
                     if (ArmorAndCostumeTypes.Contains(type) && model > 0)
                     {
                         var armorModelRegex = new Regex($@"_(?:0*{model})(?:_[^.]+)?\.(?:3dc|3do)$", RegexOptions.IgnoreCase);
                         var armorTexRegex = new Regex($@"_(?:0*{model})(?:_[^.]+)?\.(?:dds|tga)$", RegexOptions.IgnoreCase);
 
-                        var armorMeshes = allDonorFiles.Where(f =>
-                            f.RelativePath.StartsWith("Character/", StringComparison.OrdinalIgnoreCase) &&
-                            !f.RelativePath.StartsWith("Character/Monster/", StringComparison.OrdinalIgnoreCase) &&
-                            armorModelRegex.IsMatch(f.Name))
+                        var armorMeshes = allDonorFiles.Where(e =>
+                            e.NormPath.StartsWith("Character/", StringComparison.OrdinalIgnoreCase) &&
+                            !e.NormPath.StartsWith("Character/Monster/", StringComparison.OrdinalIgnoreCase) &&
+                            armorModelRegex.IsMatch(e.File.Name))
                             .ToList();
 
                         foreach (var am in armorMeshes)
                         {
-                            string[] segments = am.RelativePath.Split('/');
+                            string[] segments = am.NormPath.Split('/');
                             string? raceFolder = segments.Length >= 2 ? $"{segments[0]}/{segments[1]}/" : null;
-                            CopyFileWithTextures(am, raceFolder);
+                            AddFileWithTextures(am.File, am.NormPath, raceFolder);
                         }
 
-                        var armorTextures = allDonorFiles.Where(f =>
-                            f.RelativePath.StartsWith("Character/", StringComparison.OrdinalIgnoreCase) &&
-                            !f.RelativePath.StartsWith("Character/Monster/", StringComparison.OrdinalIgnoreCase) &&
-                            armorTexRegex.IsMatch(f.Name))
+                        var armorTextures = allDonorFiles.Where(e =>
+                            e.NormPath.StartsWith("Character/", StringComparison.OrdinalIgnoreCase) &&
+                            !e.NormPath.StartsWith("Character/Monster/", StringComparison.OrdinalIgnoreCase) &&
+                            armorTexRegex.IsMatch(e.File.Name))
                             .ToList();
 
                         foreach (var at in armorTextures)
                         {
-                            CopyFileWithTextures(at);
+                            AddFileWithTextures(at.File, at.NormPath);
+                        }
+
+                        // Fallback para elmos/capas armazenados em Item/3DO/{type:D2}_{model:D3}
+                        if (armorMeshes.Count == 0)
+                        {
+                            string prefix3 = $"{type:D2}_{model:D3}";
+                            foreach (var hm in allDonorFiles.Where(e =>
+                                e.NormPath.StartsWith("Item/3DO/", StringComparison.OrdinalIgnoreCase) &&
+                                e.File.Name.StartsWith(prefix3, StringComparison.OrdinalIgnoreCase)))
+                            {
+                                AddFileWithTextures(hm.File, hm.NormPath, "Item/");
+                            }
                         }
                     }
 
+                    // 3. Asas (Type 121)
                     if (type == 121)
                     {
                         var wingRegex = model > 0
                             ? new Regex($@"_(?:0*{model})(?:_[^.]+)?\.(?:3dc|3do|dds|tga)$", RegexOptions.IgnoreCase)
                             : null;
 
-                        var wingFiles = allDonorFiles.Where(f =>
-                            f.RelativePath.StartsWith("Character/wing", StringComparison.OrdinalIgnoreCase) &&
-                            (wingRegex == null || wingRegex.IsMatch(f.Name)))
+                        var wingFiles = allDonorFiles.Where(e =>
+                            e.NormPath.StartsWith("Character/wing", StringComparison.OrdinalIgnoreCase) &&
+                            (wingRegex == null || wingRegex.IsMatch(e.File.Name)))
                             .ToList();
 
                         if (wingFiles.Count == 0)
                         {
-                            wingFiles = allDonorFiles.Where(f =>
-                                f.RelativePath.StartsWith("Character/wing", StringComparison.OrdinalIgnoreCase) &&
-                                !targetData.FileIndex.ContainsKey(f.RelativePath))
+                            wingFiles = allDonorFiles.Where(e =>
+                                e.NormPath.StartsWith("Character/wing", StringComparison.OrdinalIgnoreCase) &&
+                                !targetNormalizedPaths.Contains(e.NormPath))
                                 .ToList();
                         }
 
                         foreach (var wf in wingFiles)
                         {
-                            CopyFileWithTextures(wf, "Character/wing");
+                            AddFileWithTextures(wf.File, wf.NormPath, "Character/wing");
                         }
                     }
 
+                    // 4. Mascotes / Pets (Type 120)
                     if (type == 120 && model > 0)
                     {
                         var petRegex = new Regex($@"_(?:0*{model})(?:_[^.]+)?\.(?:3dc|3do|dds|tga)$", RegexOptions.IgnoreCase);
-                        var petFiles = allDonorFiles.Where(f =>
-                            (f.RelativePath.StartsWith("Character/Monster/", StringComparison.OrdinalIgnoreCase) ||
-                             f.RelativePath.StartsWith("Character/Pet/", StringComparison.OrdinalIgnoreCase)) &&
-                            petRegex.IsMatch(f.Name))
+                        var petFiles = allDonorFiles.Where(e =>
+                            (e.NormPath.StartsWith("Character/Monster/", StringComparison.OrdinalIgnoreCase) ||
+                             e.NormPath.StartsWith("Character/Pet/", StringComparison.OrdinalIgnoreCase)) &&
+                            petRegex.IsMatch(e.File.Name))
                             .ToList();
 
                         foreach (var pf in petFiles)
                         {
-                            CopyFileWithTextures(pf, "Character/");
+                            AddFileWithTextures(pf.File, pf.NormPath, "Character/");
                         }
                     }
                 }
@@ -713,40 +775,70 @@ namespace ShaiyaItemImporter
 
             if (copyIcons)
             {
-                Log("Verificando folhas de ícones (Interface/ItemIcon*.dds)...");
-
-                var requiredIconSheets = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-
+                var requiredSheetNumbers = new HashSet<int>();
                 foreach (var itm in selectedItems)
                 {
                     if (itm.Icon > 0)
                     {
-                        int sheetNumber = (itm.Icon / 256) + 1;
-                        requiredIconSheets.Add($"Interface/ItemIcon{sheetNumber:D2}.dds");
-                        requiredIconSheets.Add($"Interface/item_icon{sheetNumber:D2}.dds");
+                        int zeroBased = itm.Icon / 256;
+                        requiredSheetNumbers.Add(zeroBased);
+                        requiredSheetNumbers.Add(zeroBased + 1);
                     }
                 }
 
-                var donorIconFiles = donorData.FileIndex.Values
-                    .Where(f => f.RelativePath.StartsWith("Interface/", StringComparison.OrdinalIgnoreCase) &&
-                                (f.Name.StartsWith("ItemIcon", StringComparison.OrdinalIgnoreCase) ||
-                                 f.Name.StartsWith("item_icon", StringComparison.OrdinalIgnoreCase)))
+                var donorIconFiles = allDonorFiles
+                    .Where(e => e.NormPath.StartsWith("Interface/", StringComparison.OrdinalIgnoreCase) &&
+                                (e.File.Name.StartsWith("ItemIcon", StringComparison.OrdinalIgnoreCase) ||
+                                 e.File.Name.StartsWith("item_icon", StringComparison.OrdinalIgnoreCase)) &&
+                                e.File.Name.EndsWith(".dds", StringComparison.OrdinalIgnoreCase))
                     .ToList();
 
-                foreach (var iconFile in donorIconFiles)
+                foreach (var iconEntry in donorIconFiles)
                 {
-                    bool isUsedSheet = requiredIconSheets.Contains(iconFile.RelativePath);
-                    bool isMissingInTarget = !targetData.FileIndex.ContainsKey(iconFile.RelativePath);
+                    var m = Regex.Match(iconEntry.File.Name, @"(\d+)\.dds$", RegexOptions.IgnoreCase);
+                    bool isUsedSheet = m.Success && int.TryParse(m.Groups[1].Value, out int num) && requiredSheetNumbers.Contains(num);
+                    bool isMissingInTarget = !targetNormalizedPaths.Contains(iconEntry.NormPath);
 
-                    if ((isUsedSheet || isMissingInTarget) && !extractedPaths.Contains(iconFile.RelativePath))
+                    if (isUsedSheet || isMissingInTarget)
                     {
-                        ExtractFileToPatch(donorData, iconFile, patchTempDir);
-                        extractedPaths.Add(iconFile.RelativePath);
+                        collected.TryAdd(iconEntry.NormPath, iconEntry.File);
                     }
                 }
             }
 
-            return extractedPaths.Count;
+            return collected.Values.ToList();
+        }
+
+        private int ExtractAllRequiredAssets(
+            Data donorData,
+            Data targetData,
+            List<ItemEntry> selectedItems,
+            bool copyAssets,
+            bool copyIcons,
+            string patchTempDir)
+        {
+            Log("Analisando modelos 3D (.3DO/.3DC), texturas (.DDS) e folhas de ícones (ItemIcon*.dds)...");
+
+            var filesToExtract = CollectRequiredAssetFiles(donorData, targetData, selectedItems, copyAssets, copyIcons);
+            int modelsCount = 0;
+            int texturesCount = 0;
+            int iconsCount = 0;
+
+            foreach (var sfile in filesToExtract)
+            {
+                ExtractFileToPatch(donorData, sfile, patchTempDir);
+                string norm = NormalizeRelPath(sfile.RelativePath);
+
+                if (norm.StartsWith("Interface/", StringComparison.OrdinalIgnoreCase))
+                    iconsCount++;
+                else if (sfile.Name.EndsWith(".3do", StringComparison.OrdinalIgnoreCase) || sfile.Name.EndsWith(".3dc", StringComparison.OrdinalIgnoreCase))
+                    modelsCount++;
+                else
+                    texturesCount++;
+            }
+
+            Log($"Detalhamento visual: {modelsCount} modelos 3D | {texturesCount} texturas DDS/TGA | {iconsCount} folhas de ícones.");
+            return filesToExtract.Count;
         }
 
         private static HashSet<string> ExtractEmbeddedTextureNames(byte[] modelBytes)
@@ -781,6 +873,10 @@ namespace ShaiyaItemImporter
 
                 foreach (string serverSData in serverSDataFiles)
                 {
+                    string origBak = $"{serverSData}.bak_ORIGINAL";
+                    if (!File.Exists(origBak))
+                        File.Copy(serverSData, origBak, overwrite: false);
+
                     File.Copy(serverSData, $"{serverSData}.bak_{DateTime.Now:yyyyMMdd_HHmmss}", overwrite: true);
                     File.WriteAllBytes(serverSData, itemSDataBytes);
                     Log($"Item.SData do servidor sincronizado em: {serverSData}");
@@ -794,7 +890,8 @@ namespace ShaiyaItemImporter
 
         private void ExtractFileToPatch(Data donorData, SFile sfile, string patchTempDir)
         {
-            string dest = Path.Combine(patchTempDir, sfile.RelativePath.Replace('/', Path.DirectorySeparatorChar));
+            string cleanRel = NormalizeRelPath(sfile.RelativePath).Replace('/', Path.DirectorySeparatorChar);
+            string dest = Path.Combine(patchTempDir, cleanRel);
             string? dir = Path.GetDirectoryName(dest);
             if (dir != null) Directory.CreateDirectory(dir);
 
@@ -808,7 +905,6 @@ namespace ShaiyaItemImporter
 
         private static (ushort reqWis, ushort reqLuc, ushort grade, byte server, ushort drop, byte special) SanitizeCompatFields(ItemDefinition d)
         {
-            // Essentials v16 usa ReqLuc/Grade/Special altos para sistemas custom que travam o ps_game.exe v1.4
             ushort safeReqLuc = d.ReqLuc > 500 ? (ushort)0 : ClampUShortSmallInt(d.ReqLuc);
             ushort safeGrade = d.Grade > 50 ? (ushort)0 : ClampUShortSmallInt(d.Grade);
             byte safeServer = d.Server > 1 ? (byte)0 : d.Server;
@@ -888,7 +984,6 @@ namespace ShaiyaItemImporter
             string safeName = TruncateSafe(d.Name, maxNameLen);
             byte safeCount = d.Count == 0 ? (byte)1 : d.Count;
 
-            // Remove qualquer registro conflitante com mesmo (Type, TypeID) e ItemID diferente antes de atualizar/inserir
             string query = @"
 DELETE FROM Items WHERE Type = @Type AND TypeID = @TypeID AND ItemID <> @ItemID;
 
@@ -1043,10 +1138,10 @@ END";
 
             return $@"DELETE FROM Items WHERE Type = {d.ItemType} AND TypeID = {d.ItemTypeId} AND ItemID <> {itemId};
 IF EXISTS (SELECT 1 FROM Items WHERE ItemID = {itemId})
-    UPDATE Items SET ItemName = '{safeName}', Reqlevel = {ClampSmallInt(d.MinLevel)}, Country = {safeCountry}, Attackfighter = {d.AttackFighter}, Defensefighter = {d.DefenseFighter}, Patrolrogue = {d.PatrolRogue}, Shootrogue = {d.ShootRogue}, Attackmage = {d.AttackMage}, Defensemage = {d.DefenseMage}, Grow = {d.Grow}, ReqStr = {ClampSmallInt(d.ReqStr)}, ReqDex = {ClampSmallInt(d.ReqDex)}, ReqRec = {ClampSmallInt(d.ReqRec)}, ReqInt = {ClampSmallInt(d.ReqInt)}, ReqWis = {safeReqWis}, Reqluc = {safeReqLuc}, ReqVg = {ClampSmallInt(d.ReqVg)}, ReqOg = {d.ReqOg}, ReqIg = {d.ReqIg}, Range = {ClampSmallInt(d.Range)}, AttackTime = {d.AttackTime}, Attrib = {d.Attrib}, Special = {safeSpecial}, Slot = {d.Slot}, Quality = {ClampSmallInt(d.Quality)}, Effect1 = {ClampSmallInt(d.Attack)}, Effect2 = {ClampSmallInt(d.AttackAdd)}, Effect3 = {ClampSmallInt(d.Def)}, Effect4 = {ClampSmallInt(d.Resist)}, ConstHP = {ClampSmallInt(d.Hp)}, ConstSP = {ClampSmallInt(d.Sp)}, ConstMP = {ClampSmallInt(d.Mp)}, ConstStr = {ClampSmallInt(d.Str)}, ConstDex = {ClampSmallInt(d.Dex)}, ConstRec = {ClampSmallInt(d.Rec)}, ConstInt = {ClampSmallInt(d.Int)}, ConstWis = {ClampSmallInt(d.Wis)}, ConstLuc = {ClampSmallInt(d.Luc)}, Speed = {d.Speed}, Exp = {d.Exp}, Buy = {Math.Min(d.BuyPrice, (uint)int.MaxValue)}, Sell = {Math.Min(d.SellPrice, (uint)int.MaxValue)}, Grade = {safeGrade}, [Drop] = {safeDrop}, Server = {safeServer}, Count = {safeCount} WHERE ItemID = {itemId};
+    UPDATE Items SET ItemName = '{safeName}', Reqlevel = {ClampSmallInt(d.MinLevel)}, Country = {safeCountry}, Attackfighter = {d.AttackFighter}, Defensefighter = {d.DefenseFighter}, Patrolrogue = {d.PatrolRogue}, Shootrogue = {d.ShootRogue}, Attackmage = {d.AttackMage}, Defensemage = {d.DefenseMage}, Grow = {d.Grow}, ReqStr = {ClampSmallInt(d.ReqStr)}, ReqDex = {ClampSmallInt(d.ReqDex)}, ReqRec = {ClampSmallInt(d.ReqRec)}, ReqInt = {ClampSmallInt(d.ReqInt)}, ReqWis = {safeReqWis}, Reqluc = {safeReqLuc}, ReqVg = {ClampSmallInt(d.ReqVg)}, ReqOg = {d.ReqOg}, ReqIg = {d.ReqIg}, Range = {ClampSmallInt(d.Range)}, AttackTime = {d.AttackTime}, Attrib = {d.Attrib}, Special = {safeSpecial}, Slot = {d.Slot}, Quality = {ClampUShortSmallInt(d.Quality)}, Effect1 = {ClampSmallInt(d.Attack)}, Effect2 = {ClampSmallInt(d.AttackAdd)}, Effect3 = {ClampSmallInt(d.Def)}, Effect4 = {ClampSmallInt(d.Resist)}, ConstHP = {ClampSmallInt(d.Hp)}, ConstSP = {ClampSmallInt(d.Sp)}, ConstMP = {ClampSmallInt(d.Mp)}, ConstStr = {ClampSmallInt(d.Str)}, ConstDex = {ClampSmallInt(d.Dex)}, ConstRec = {ClampSmallInt(d.Rec)}, ConstInt = {ClampSmallInt(d.Int)}, ConstWis = {ClampSmallInt(d.Wis)}, ConstLuc = {ClampSmallInt(d.Luc)}, Speed = {d.Speed}, Exp = {d.Exp}, Buy = {Math.Min(d.BuyPrice, (uint)int.MaxValue)}, Sell = {Math.Min(d.SellPrice, (uint)int.MaxValue)}, Grade = {safeGrade}, [Drop] = {safeDrop}, Server = {safeServer}, Count = {safeCount} WHERE ItemID = {itemId};
 ELSE
     INSERT INTO Items (ItemID, ItemName, Type, TypeID, Reqlevel, Country, Attackfighter, Defensefighter, Patrolrogue, Shootrogue, Attackmage, Defensemage, Grow, ReqStr, ReqDex, ReqRec, ReqInt, ReqWis, Reqluc, ReqVg, ReqOg, ReqIg, Range, AttackTime, Attrib, Special, Slot, Quality, Effect1, Effect2, Effect3, Effect4, ConstHP, ConstSP, ConstMP, ConstStr, ConstDex, ConstRec, ConstInt, ConstWis, ConstLuc, Speed, Exp, Buy, Sell, Grade, [Drop], Server, Count)
-    VALUES ({itemId}, '{safeName}', {d.ItemType}, {d.ItemTypeId}, {ClampSmallInt(d.MinLevel)}, {safeCountry}, {d.AttackFighter}, {d.DefenseFighter}, {d.PatrolRogue}, {d.ShootRogue}, {d.AttackMage}, {d.DefenseMage}, {d.Grow}, {ClampSmallInt(d.ReqStr)}, {ClampSmallInt(d.ReqDex)}, {ClampSmallInt(d.ReqRec)}, {ClampSmallInt(d.ReqInt)}, {safeReqWis}, {safeReqLuc}, {ClampSmallInt(d.ReqVg)}, {d.ReqOg}, {d.ReqIg}, {ClampSmallInt(d.Range)}, {d.AttackTime}, {d.Attrib}, {safeSpecial}, {d.Slot}, {ClampSmallInt(d.Quality)}, {ClampSmallInt(d.Attack)}, {ClampSmallInt(d.AttackAdd)}, {ClampSmallInt(d.Def)}, {ClampSmallInt(d.Resist)}, {ClampSmallInt(d.Hp)}, {ClampSmallInt(d.Sp)}, {ClampSmallInt(d.Mp)}, {ClampSmallInt(d.Str)}, {ClampSmallInt(d.Dex)}, {ClampSmallInt(d.Rec)}, {ClampSmallInt(d.Int)}, {ClampSmallInt(d.Wis)}, {ClampSmallInt(d.Luc)}, {d.Speed}, {d.Exp}, {Math.Min(d.BuyPrice, (uint)int.MaxValue)}, {Math.Min(d.SellPrice, (uint)int.MaxValue)}, {safeGrade}, {safeDrop}, {safeServer}, {safeCount});";
+    VALUES ({itemId}, '{safeName}', {d.ItemType}, {d.ItemTypeId}, {ClampSmallInt(d.MinLevel)}, {safeCountry}, {d.AttackFighter}, {d.DefenseFighter}, {d.PatrolRogue}, {d.ShootRogue}, {d.AttackMage}, {d.DefenseMage}, {d.Grow}, {ClampSmallInt(d.ReqStr)}, {ClampSmallInt(d.ReqDex)}, {ClampSmallInt(d.ReqRec)}, {ClampSmallInt(d.ReqInt)}, {safeReqWis}, {safeReqLuc}, {ClampSmallInt(d.ReqVg)}, {d.ReqOg}, {d.ReqIg}, {ClampSmallInt(d.Range)}, {d.AttackTime}, {d.Attrib}, {safeSpecial}, {d.Slot}, {ClampUShortSmallInt(d.Quality)}, {ClampSmallInt(d.Attack)}, {ClampSmallInt(d.AttackAdd)}, {ClampSmallInt(d.Def)}, {ClampSmallInt(d.Resist)}, {ClampSmallInt(d.Hp)}, {ClampSmallInt(d.Sp)}, {ClampSmallInt(d.Mp)}, {ClampSmallInt(d.Str)}, {ClampSmallInt(d.Dex)}, {ClampSmallInt(d.Rec)}, {ClampSmallInt(d.Int)}, {ClampSmallInt(d.Wis)}, {ClampSmallInt(d.Luc)}, {d.Speed}, {d.Exp}, {Math.Min(d.BuyPrice, (uint)int.MaxValue)}, {Math.Min(d.SellPrice, (uint)int.MaxValue)}, {safeGrade}, {safeDrop}, {safeServer}, {safeCount});";
         }
 
         private string BuildProductListUpsertScript(ItemDefinition d)
@@ -1117,6 +1212,11 @@ ELSE
                 31 => "Poções / Consumíveis",
                 32 => "Itens de Missão",
                 33 => "Diversos / Craft",
+                72 => "Elmo Especial",
+                73 => "Peitoral Especial",
+                74 => "Calça Especial",
+                75 => "Luva Especial",
+                76 => "Bota Especial",
                 90 => "Capas Especiais",
                 91 => "Peitoral Imperial",
                 92 => "Botas Imperiais",
@@ -1147,6 +1247,3 @@ ELSE
         }
     }
 }
-
-
-
