@@ -45,6 +45,31 @@ namespace ShaiyaItemImporter
             bool copyIcons = !args.Contains("--no-icons");
             bool dryRun = args.Contains("--dry-run");
 
+            bool validateOnly = args.Contains("--validate");
+            string? sqlFileArg = GetArg(args, "--sql-file");
+
+            if (validateOnly)
+            {
+                if (string.IsNullOrEmpty(target) || !File.Exists(target))
+                {
+                    Console.WriteLine($"ERRO: Arquivo destino não encontrado: {target}");
+                    return 1;
+                }
+
+                if (string.IsNullOrWhiteSpace(sqlFileArg))
+                {
+                    string targetDir = Path.GetDirectoryName(target) ?? "";
+                    sqlFileArg = Directory.GetFiles(targetDir, "imported_items_*.sql")
+                        .OrderByDescending(File.GetLastWriteTime)
+                        .FirstOrDefault();
+                }
+
+                using var valEngine = new ImporterEngine();
+                valEngine.OnLog += msg => Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] {msg}");
+                bool ok = await valEngine.ValidateTargetAsync(target, sql, sqlFileArg);
+                return ok ? 0 : 3;
+            }
+
             if (string.IsNullOrEmpty(donor) || !File.Exists(donor))
             {
                 Console.WriteLine($"ERRO: Arquivo doador não encontrado: {donor}");

@@ -2,6 +2,7 @@
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
@@ -574,6 +575,236 @@ namespace ShaiyaItemImporter
                 {
                     try { Directory.Delete(tempDir, true); } catch { }
                 }
+            });
+        }
+
+        public async Task<bool> ValidateTargetAsync(
+            string targetSahPath,
+            string sqlConnectionString,
+            string? importedSqlScriptPath = null)
+        {
+            return await Task.Run(() =>
+            {
+                DisposeData();
+
+                Log("=== INICIANDO AUDITORIA DE INTEGRIDADE E REFERÊNCIAS ===");
+                string targetSafPath = Path.ChangeExtension(targetSahPath, ".saf");
+                TargetData = new Data(targetSahPath, targetSafPath);
+                (TargetItem, TargetEpisode, TargetWasEncrypted) = ReadItemSDataAuto(TargetData, "Core Validado");
+
+                Log($"1. Cliente validado: {TargetData.FileIndex.Count} arquivos no data.sah | Formato: {TargetEpisode} | Criptografado: {(TargetWasEncrypted ? "Sim" : "Não")}");
+
+                // Indexa todos os arquivos presentes no cliente destino após o patch
+                var targetNormPaths = new Dictionary<string, SFile>(StringComparer.OrdinalIgnoreCase);
+                var targetFileNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+                foreach (var f in TargetData.FileIndex.Values)
+                {
+                    string norm = NormalizeRelPath(f.RelativePath);
+                    targetNormPaths.TryAdd(norm, f);
+                    targetFileNames.Add(f.Name);
+                }
+
+                // Determina o escopo de ItemIDs importados (lendo o script .sql gerado, se disponível)
+                var targetItemIds = new HashSet<int>();
+                if (!string.IsNullOrWhiteSpace(importedSqlScriptPath) && File.Exists(importedSqlScriptPath))
+                {
+                    string sqlText = File.ReadAllText(importedSqlScriptPath);
+                    foreach (Match m in Regex.Matches(sqlText, @"WHERE ItemID = (\d+)"))
+                    {
+                        if (int.TryParse(m.Groups[1].Value, out int id))
+                            targetItemIds.Add(id);
+                    }
+                    Log($"2. Escopo da auditoria: {targetItemIds.Count} itens extraídos de {Path.GetFileName(importedSqlScriptPath)}");
+                }
+
+                var itemsToCheck = new List<ItemDefinition>();
+                foreach (var grp in TargetItem.ItemGroups)
+                {
+                    foreach (var def in grp.ItemDefinitions)
+                    {
+                        if (def.ItemType == 0 || def.ItemTypeId == 0) continue;
+                        int itemId = def.ItemType * 1000 + def.ItemTypeId;
+                        if (targetItemIds.Count == 0 || targetItemIds.Contains(itemId))
+                        {
+                            itemsToCheck.Add(def);
+                        }
+                    }
+                }
+
+                // 3. Valida sincronia com SQL Server (PS_GameDefs.dbo.Items)
+                int sqlMissing = 0;
+                int sqlMismatch = 0;
+                if (!string.IsNullOrWhiteSpace(sqlConnectionString))
+                {
+                    using var conn = new SqlConnection(sqlConnectionString);
+                    conn.Open();
+
+                    var sqlItems = new Dictionary<int, (string Name, int ReqLevel, int Effect1, int Effect3)>();
+                    using (var cmd = new SqlCommand("SELECT ItemID, ItemName, Reqlevel, Effect1, Effect3 FROM Items", conn))
+                    using (var reader = cmd.ExecuteReader())
+                    {
+                        while (reader.Read())
+                        {
+                            int id = reader.GetInt32(0);
+                            string name = reader.IsDBNull(1) ? "" : reader.GetString(1).Trim();
+                            int lvl = Convert.ToInt32(reader.GetValue(2));
+                            int atk = Convert.ToInt32(reader.GetValue(3));
+                            int def = Convert.ToInt32(reader.GetValue(4));
+                            sqlItems[id] = (name, lvl, atk, def);
+                        }
+                    }
+
+                    foreach (var def in itemsToCheck)
+                    {
+                        int itemId = def.ItemType * 1000 + def.ItemTypeId;
+                        if (!sqlItems.TryGetValue(itemId, out var row))
+                        {
+                            sqlMissing++;
+                            Log($"   [FALHA SQL] ItemID {itemId} ({def.Name}) existe no Item.SData mas não está no SQL!");
+                        }
+                        else if (row.ReqLevel != def.MinLevel || row.Effect1 != ClampSmallInt(def.Attack) || row.Effect3 != ClampSmallInt(def.Def))
+                        {
+                            sqlMismatch++;
+                            Log($"   [DIVERGÊNCIA SQL] ItemID {itemId} ({def.Name}): SData(Lvl={def.MinLevel},Atk={def.Attack},Def={def.Def}) != SQL(Lvl={row.ReqLevel},Atk={row.Effect1},Def={row.Effect3})");
+                        }
+                    }
+                    Log($"3. Sincronia SQL Server: {itemsToCheck.Count - sqlMissing} presentes | {sqlMissing} ausentes | {sqlMismatch} divergentes.");
+                }
+
+                // 4. Valida referências visuais (Modelos 3D, Texturas embutidas e Folhas de Ícones)
+                int missingModels = 0;
+                int missingTextures = 0;
+                int missingIcons = 0;
+                int checkedModelsCount = 0;
+                var checkedModelPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+                foreach (var def in itemsToCheck)
+                {
+                    byte type = def.ItemType;
+                    int model = def.Model;
+                    int icon = def.Icon;
+
+                    // 4.1 Valida folha de ícone
+                    if (icon > 0)
+                    {
+                        int sheet1Based = (icon / 256) + 1;
+                        bool hasIcon =
+                            targetNormPaths.ContainsKey($"interface/icon/{icon}.dds") ||
+                            targetNormPaths.ContainsKey($"interface/icon/{icon:D2}.dds") ||
+                            targetNormPaths.ContainsKey($"interface/ItemIcon{sheet1Based:D2}.dds") ||
+                            targetNormPaths.ContainsKey($"interface/item_icon{sheet1Based:D2}.dds");
+
+                        if (!hasIcon)
+                        {
+                            missingIcons++;
+                            Log($"   [ÍCONE AUSENTE] [{type:D3}:{def.ItemTypeId:D3}] {def.Name} -> Icon={icon}");
+                        }
+                    }
+
+                    // 4.2 Valida modelo 3D e suas texturas internas
+                    if (model > 0 && (WeaponAndShieldTypes.Contains(type) || ArmorAndCostumeTypes.Contains(type) || type == 120 || type == 121))
+                    {
+                        List<KeyValuePair<string, SFile>> matchedMeshes;
+
+                        if (WeaponAndShieldTypes.Contains(type))
+                        {
+                            var rx = new Regex($@"^(?:[a-z]+_)?0*{type}_(?:[a-z]_)?0*{model}(?:_[^.]+)?\.3do$", RegexOptions.IgnoreCase);
+                            matchedMeshes = targetNormPaths
+                                .Where(kv => kv.Key.StartsWith("Item/3DO/", StringComparison.OrdinalIgnoreCase) && rx.IsMatch(kv.Value.Name))
+                                .ToList();
+                        }
+                        else if (type == 121)
+                        {
+                            var rx = new Regex($@"_(?:0*{model})(?:_[^.]+)?\.(?:3dc|3do)$", RegexOptions.IgnoreCase);
+                            matchedMeshes = targetNormPaths
+                                .Where(kv => kv.Key.StartsWith("Character/wing", StringComparison.OrdinalIgnoreCase) && rx.IsMatch(kv.Value.Name))
+                                .ToList();
+                        }
+                        else if (type == 120)
+                        {
+                            var rx = new Regex($@"_(?:0*{model})(?:_[^.]+)?\.(?:3dc|3do)$", RegexOptions.IgnoreCase);
+                            matchedMeshes = targetNormPaths
+                                .Where(kv => (kv.Key.StartsWith("Character/Monster/", StringComparison.OrdinalIgnoreCase) ||
+                                              kv.Key.StartsWith("Character/Pet/", StringComparison.OrdinalIgnoreCase)) &&
+                                             rx.IsMatch(kv.Value.Name))
+                                .ToList();
+                        }
+                        else
+                        {
+                            var rxArmor = new Regex($@"_(?:0*{model})(?:_[^.]+)?\.(?:3dc|3do)$", RegexOptions.IgnoreCase);
+                            var rxItem = new Regex($@"^(?:[a-z]+_)?0*{type}_(?:[a-z]_)?0*{model}(?:_[^.]+)?\.(?:3do|3dc)$", RegexOptions.IgnoreCase);
+                            matchedMeshes = targetNormPaths
+                                .Where(kv => (kv.Key.StartsWith("Character/", StringComparison.OrdinalIgnoreCase) &&
+                                              !kv.Key.StartsWith("Character/Monster/", StringComparison.OrdinalIgnoreCase) &&
+                                              rxArmor.IsMatch(kv.Value.Name)) ||
+                                             (kv.Key.StartsWith("Item/3DO/", StringComparison.OrdinalIgnoreCase) &&
+                                              rxItem.IsMatch(kv.Value.Name)))
+                                .ToList();
+                        }
+
+                        if (matchedMeshes.Count == 0)
+                        {
+                            missingModels++;
+                            Log($"   [MODELO 3D AUSENTE] [{type:D3}:{def.ItemTypeId:D3}] {def.Name} -> Model={model}");
+                        }
+                        else
+                        {
+                            foreach (var mesh in matchedMeshes)
+                            {
+                                if (!checkedModelPaths.Add(mesh.Key)) continue;
+                                checkedModelsCount++;
+
+                                byte[] meshBytes = TargetData.GetFileBuffer(mesh.Value);
+                                foreach (string texName in ExtractEmbeddedTextureNames(meshBytes))
+                                {
+                                    if (!targetFileNames.Contains(texName))
+                                    {
+                                        missingTextures++;
+                                        Log($"   [TEXTURA AUSENTE] Modelo '{mesh.Key}' referencia '{texName}', não encontrada no data.sah!");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Log($"4. Referências visuais ({itemsToCheck.Count} itens | {checkedModelsCount} malhas 3D únicas inspecionadas):");
+                Log($"   • Modelos 3D ausentes: {missingModels}");
+                Log($"   • Texturas DDS/TGA ausentes: {missingTextures}");
+                Log($"   • Folhas de ícones ausentes: {missingIcons}");
+
+                // 5. Verifica hash SHA-256 do Item.SData no servidor vs cliente
+                var clientSDataFile = TargetData.GetFile("Item/Item.SData");
+                if (clientSDataFile != null)
+                {
+                    byte[] clientBytes = TargetData.GetFileBuffer(clientSDataFile);
+                    string clientHash = Convert.ToHexString(SHA256.HashData(clientBytes));
+                    string? clientDir = Path.GetDirectoryName(targetSahPath);
+                    string? coreRootDir = clientDir != null ? Directory.GetParent(clientDir)?.FullName : null;
+
+                    if (coreRootDir != null && Directory.Exists(coreRootDir))
+                    {
+                        var sdataFiles = Directory.GetFiles(coreRootDir, "Item.SData", SearchOption.AllDirectories)
+                            .Where(p => !p.Contains(".bak_", StringComparison.OrdinalIgnoreCase))
+                            .ToList();
+
+                        Log($"5. Arquivos Item.SData encontrados na estrutura do projeto ({sdataFiles.Count}):");
+                        foreach (string f in sdataFiles)
+                        {
+                            string h = Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(f)));
+                            string status = h == clientHash ? "OK (Idêntico ao data.sah)" : "DIFERENTE do data.sah!";
+                            Log($"   • {f} -> {status}");
+                        }
+                    }
+                }
+
+                bool allValid = (sqlMissing == 0 && sqlMismatch == 0 && missingModels == 0 && missingTextures == 0 && missingIcons == 0);
+                Log(allValid
+                    ? "=== RESULTADO: 100% VALIDADO SEM REFERÊNCIAS QUEBRADAS ==="
+                    : "=== RESULTADO: ATENÇÃO — VERIFIQUE OS AVISOS ACIMA ===");
+
+                return allValid;
             });
         }
 
