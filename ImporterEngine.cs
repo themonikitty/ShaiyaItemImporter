@@ -353,18 +353,25 @@ namespace ShaiyaItemImporter
                     int modelsCount = previewFiles.Count(f => f.Name.EndsWith(".3do", StringComparison.OrdinalIgnoreCase) || f.Name.EndsWith(".3dc", StringComparison.OrdinalIgnoreCase));
                     int iconsCount = previewFiles.Count(f => NormalizeRelPath(f.RelativePath).StartsWith("Interface/", StringComparison.OrdinalIgnoreCase));
                     int texCount = previewFiles.Count - modelsCount - iconsCount;
-                    Log($"[DRY-RUN] Arquivos visuais detectados: {previewFiles.Count} total ({modelsCount} modelos 3D, {texCount} texturas DDS/TGA, {iconsCount} folhas de ícones).");
+                    Log($"[DRY-RUN] Arquivos visuais selecionados: {previewFiles.Count} total ({modelsCount} modelos 3D, {texCount} texturas DDS/TGA, {iconsCount} folhas de ícones).");
 
                     var sampleModels = previewFiles
                         .Where(f => f.Name.EndsWith(".3do", StringComparison.OrdinalIgnoreCase) || f.Name.EndsWith(".3dc", StringComparison.OrdinalIgnoreCase))
                         .Select(f => NormalizeRelPath(f.RelativePath))
-                        .Take(6);
+                        .Take(8);
                     Log("[DRY-RUN] Amostra de modelos 3D: " + string.Join(", ", sampleModels));
+
+                    var sampleTextures = previewFiles
+                        .Where(f => !NormalizeRelPath(f.RelativePath).StartsWith("Interface/", StringComparison.OrdinalIgnoreCase) &&
+                                    (f.Name.EndsWith(".dds", StringComparison.OrdinalIgnoreCase) || f.Name.EndsWith(".tga", StringComparison.OrdinalIgnoreCase)))
+                        .Select(f => NormalizeRelPath(f.RelativePath))
+                        .Take(8);
+                    Log("[DRY-RUN] Amostra de texturas: " + string.Join(", ", sampleTextures));
 
                     var sampleIcons = previewFiles
                         .Where(f => NormalizeRelPath(f.RelativePath).StartsWith("Interface/", StringComparison.OrdinalIgnoreCase))
                         .Select(f => NormalizeRelPath(f.RelativePath))
-                        .Take(6);
+                        .Take(8);
                     Log("[DRY-RUN] Amostra de ícones: " + string.Join(", ", sampleIcons));
 
                     return totalCount;
@@ -599,180 +606,130 @@ namespace ShaiyaItemImporter
             bool copyAssets,
             bool copyIcons)
         {
-            var collected = new Dictionary<string, SFile>(StringComparer.OrdinalIgnoreCase);
-
+            // ETAPA 1: Indexar todos os arquivos do cliente doador por extensão
             var targetNormalizedPaths = new HashSet<string>(
                 targetData.FileIndex.Values.Select(f => NormalizeRelPath(f.RelativePath)),
                 StringComparer.OrdinalIgnoreCase);
 
-            var allDonorFiles = donorData.FileIndex.Values
-                .Select(f => (File: f, NormPath: NormalizeRelPath(f.RelativePath)))
-                .ToList();
+            var all3DModels = new List<(SFile File, string NormPath)>();
+            var allTextures = new List<(SFile File, string NormPath)>();
+            var texturesByFileName = new Dictionary<string, List<(SFile File, string NormPath)>>(StringComparer.OrdinalIgnoreCase);
+            var texturesByStem = new Dictionary<string, List<(SFile File, string NormPath)>>(StringComparer.OrdinalIgnoreCase);
+            var allIconSheets = new List<(SFile File, string NormPath)>();
 
-            var donorTexturesByFileName = new Dictionary<string, List<(SFile File, string NormPath)>>(StringComparer.OrdinalIgnoreCase);
-            foreach (var entry in allDonorFiles)
+            foreach (var f in donorData.FileIndex.Values)
             {
-                if (entry.File.Name.EndsWith(".dds", StringComparison.OrdinalIgnoreCase) ||
-                    entry.File.Name.EndsWith(".tga", StringComparison.OrdinalIgnoreCase))
+                string normPath = NormalizeRelPath(f.RelativePath);
+                string ext = Path.GetExtension(f.Name);
+
+                if (ext.Equals(".3do", StringComparison.OrdinalIgnoreCase) ||
+                    ext.Equals(".3dc", StringComparison.OrdinalIgnoreCase))
                 {
-                    if (!donorTexturesByFileName.TryGetValue(entry.File.Name, out var list))
-                    {
-                        list = new List<(SFile, string)>();
-                        donorTexturesByFileName[entry.File.Name] = list;
-                    }
-                    list.Add(entry);
+                    all3DModels.Add((f, normPath));
                 }
-            }
-
-            void AddFileWithTextures(SFile sfile, string normPath, string? preferredTextureFolder = null)
-            {
-                collected.TryAdd(normPath, sfile);
-
-                if (sfile.Name.EndsWith(".3do", StringComparison.OrdinalIgnoreCase) ||
-                    sfile.Name.EndsWith(".3dc", StringComparison.OrdinalIgnoreCase))
+                else if (ext.Equals(".dds", StringComparison.OrdinalIgnoreCase) ||
+                         ext.Equals(".tga", StringComparison.OrdinalIgnoreCase))
                 {
-                    byte[] modelBytes = donorData.GetFileBuffer(sfile);
-                    var embeddedTexNames = ExtractEmbeddedTextureNames(modelBytes);
+                    allTextures.Add((f, normPath));
 
-                    foreach (string texName in embeddedTexNames)
+                    if (!texturesByFileName.TryGetValue(f.Name, out var nameList))
                     {
-                        if (donorTexturesByFileName.TryGetValue(texName, out var matchingTexFiles))
-                        {
-                            foreach (var texEntry in matchingTexFiles)
-                            {
-                                if (preferredTextureFolder != null &&
-                                    matchingTexFiles.Count > 1 &&
-                                    !texEntry.NormPath.StartsWith(preferredTextureFolder, StringComparison.OrdinalIgnoreCase))
-                                {
-                                    continue;
-                                }
+                        nameList = new List<(SFile, string)>();
+                        texturesByFileName[f.Name] = nameList;
+                    }
+                    nameList.Add((f, normPath));
 
-                                collected.TryAdd(texEntry.NormPath, texEntry.File);
-                            }
-                        }
+                    string stem = Path.GetFileNameWithoutExtension(f.Name);
+                    if (!texturesByStem.TryGetValue(stem, out var stemList))
+                    {
+                        stemList = new List<(SFile, string)>();
+                        texturesByStem[stem] = stemList;
+                    }
+                    stemList.Add((f, normPath));
+
+                    if (normPath.StartsWith("interface/icon/", StringComparison.OrdinalIgnoreCase) ||
+                        (normPath.StartsWith("interface/", StringComparison.OrdinalIgnoreCase) &&
+                         f.Name.Contains("icon", StringComparison.OrdinalIgnoreCase)))
+                    {
+                        allIconSheets.Add((f, normPath));
                     }
                 }
             }
+
+            Log($"Indexação por extensão no doador: {all3DModels.Count} modelos (.3DO/.3DC) | {allTextures.Count} texturas (.DDS/.TGA) | {allIconSheets.Count} folhas de ícones.");
+
+            // ETAPA 2: Filtrar e selecionar os arquivos desejados
+            var selectedFiles = new Dictionary<string, SFile>(StringComparer.OrdinalIgnoreCase);
 
             if (copyAssets)
             {
-                foreach (var itm in selectedItems)
+                var wantedModels = new HashSet<int>(selectedItems.Where(i => i.Model > 0).Select(i => i.Model));
+                var modelRegexes = wantedModels
+                    .Select(m => new Regex($@"(?:^|[_\-])0*{m}(?:[_\-.]|$)", RegexOptions.IgnoreCase))
+                    .ToList();
+
+                var chosen3DModels = new List<(SFile File, string NormPath)>();
+
+                foreach (var entry in all3DModels)
                 {
-                    int model = itm.Model;
-                    byte type = itm.Type;
-
-                    // 1. Armas e escudos (suporta 01_077.3DO, 01_L_077.3DO, 01_F_077.3DO, etc.)
-                    if (WeaponAndShieldTypes.Contains(type) || (!ArmorAndCostumeTypes.Contains(type) && type != 120 && type != 121 && model > 0))
+                    // Ignora monstros e NPCs estáticos
+                    if (entry.NormPath.StartsWith("Character/Monster/", StringComparison.OrdinalIgnoreCase) ||
+                        entry.NormPath.StartsWith("Character/Npc/", StringComparison.OrdinalIgnoreCase))
                     {
-                        var itemAssetRegex = new Regex(
-                            $@"^(?:[a-z]+_)?0*{type}_(?:[a-z]_)?0*{model}(?:_[^.]+)?\.(?:3do|3dc|dds|tga)$",
-                            RegexOptions.IgnoreCase);
-
-                        var weaponModels = allDonorFiles.Where(e =>
-                            e.NormPath.StartsWith("Item/3DO/", StringComparison.OrdinalIgnoreCase) &&
-                            itemAssetRegex.IsMatch(e.File.Name))
-                            .ToList();
-
-                        foreach (var wm in weaponModels)
-                        {
-                            AddFileWithTextures(wm.File, wm.NormPath, "Item/");
-                        }
-
-                        var weaponTextures = allDonorFiles.Where(e =>
-                            (e.NormPath.StartsWith("Item/DDS/", StringComparison.OrdinalIgnoreCase) ||
-                             e.NormPath.StartsWith("Item/Texture/", StringComparison.OrdinalIgnoreCase)) &&
-                            itemAssetRegex.IsMatch(e.File.Name))
-                            .ToList();
-
-                        foreach (var wt in weaponTextures)
-                        {
-                            AddFileWithTextures(wt.File, wt.NormPath);
-                        }
+                        continue;
                     }
 
-                    // 2. Armaduras, elmos, roupas e fantasias
-                    if (ArmorAndCostumeTypes.Contains(type) && model > 0)
+                    bool isEquipmentFolder =
+                        entry.NormPath.StartsWith("Item/", StringComparison.OrdinalIgnoreCase) ||
+                        entry.NormPath.StartsWith("Character/", StringComparison.OrdinalIgnoreCase);
+
+                    if (!isEquipmentFolder)
+                        continue;
+
+                    // Seleciona se: (1) não existe no cliente Core OU (2) bate com algum Model ID importado
+                    bool isExclusiveInDonor = !targetNormalizedPaths.Contains(entry.NormPath);
+                    bool matchesItemModel = modelRegexes.Any(rx => rx.IsMatch(entry.File.Name));
+
+                    if (isExclusiveInDonor || matchesItemModel)
                     {
-                        var armorModelRegex = new Regex($@"_(?:0*{model})(?:_[^.]+)?\.(?:3dc|3do)$", RegexOptions.IgnoreCase);
-                        var armorTexRegex = new Regex($@"_(?:0*{model})(?:_[^.]+)?\.(?:dds|tga)$", RegexOptions.IgnoreCase);
-
-                        var armorMeshes = allDonorFiles.Where(e =>
-                            e.NormPath.StartsWith("Character/", StringComparison.OrdinalIgnoreCase) &&
-                            !e.NormPath.StartsWith("Character/Monster/", StringComparison.OrdinalIgnoreCase) &&
-                            armorModelRegex.IsMatch(e.File.Name))
-                            .ToList();
-
-                        foreach (var am in armorMeshes)
+                        if (selectedFiles.TryAdd(entry.NormPath, entry.File))
                         {
-                            string[] segments = am.NormPath.Split('/');
-                            string? raceFolder = segments.Length >= 2 ? $"{segments[0]}/{segments[1]}/" : null;
-                            AddFileWithTextures(am.File, am.NormPath, raceFolder);
+                            chosen3DModels.Add(entry);
                         }
+                    }
+                }
 
-                        var armorTextures = allDonorFiles.Where(e =>
-                            e.NormPath.StartsWith("Character/", StringComparison.OrdinalIgnoreCase) &&
-                            !e.NormPath.StartsWith("Character/Monster/", StringComparison.OrdinalIgnoreCase) &&
-                            armorTexRegex.IsMatch(e.File.Name))
-                            .ToList();
+                // Para cada .3DO/.3DC escolhido, puxa automaticamente todas as texturas referenciadas dentro dele + mesmo stem
+                foreach (var modelEntry in chosen3DModels)
+                {
+                    string[] segments = modelEntry.NormPath.Split('/');
+                    string? rootFolder = segments.Length >= 2 ? $"{segments[0]}/{segments[1]}/" : null;
 
-                        foreach (var at in armorTextures)
+                    // 1) Texturas embutidas no arquivo 3D
+                    byte[] modelBytes = donorData.GetFileBuffer(modelEntry.File);
+                    foreach (string texName in ExtractEmbeddedTextureNames(modelBytes))
+                    {
+                        if (texturesByFileName.TryGetValue(texName, out var matches))
                         {
-                            AddFileWithTextures(at.File, at.NormPath);
-                        }
-
-                        if (armorMeshes.Count == 0)
-                        {
-                            var helmItemRegex = new Regex(
-                                $@"^(?:[a-z]+_)?0*{type}_(?:[a-z]_)?0*{model}(?:_[^.]+)?\.(?:3do|3dc|dds|tga)$",
-                                RegexOptions.IgnoreCase);
-                            foreach (var hm in allDonorFiles.Where(e =>
-                                e.NormPath.StartsWith("Item/", StringComparison.OrdinalIgnoreCase) &&
-                                helmItemRegex.IsMatch(e.File.Name)))
+                            foreach (var tex in matches)
                             {
-                                AddFileWithTextures(hm.File, hm.NormPath, "Item/");
+                                if (rootFolder != null && matches.Count > 1 &&
+                                    !tex.NormPath.StartsWith(rootFolder, StringComparison.OrdinalIgnoreCase))
+                                {
+                                    continue;
+                                }
+                                selectedFiles.TryAdd(tex.NormPath, tex.File);
                             }
                         }
                     }
 
-                    // 3. Asas (Type 121)
-                    if (type == 121)
+                    // 2) Texturas com o mesmo nome base (ex.: 03_F_201.3DO -> 03_F_201.dds)
+                    string modelStem = Path.GetFileNameWithoutExtension(modelEntry.File.Name);
+                    if (texturesByStem.TryGetValue(modelStem, out var stemMatches))
                     {
-                        var wingRegex = model > 0
-                            ? new Regex($@"_(?:0*{model})(?:_[^.]+)?\.(?:3dc|3do|dds|tga)$", RegexOptions.IgnoreCase)
-                            : null;
-
-                        var wingFiles = allDonorFiles.Where(e =>
-                            e.NormPath.StartsWith("Character/wing", StringComparison.OrdinalIgnoreCase) &&
-                            (wingRegex == null || wingRegex.IsMatch(e.File.Name)))
-                            .ToList();
-
-                        if (wingFiles.Count == 0)
+                        foreach (var tex in stemMatches)
                         {
-                            wingFiles = allDonorFiles.Where(e =>
-                                e.NormPath.StartsWith("Character/wing", StringComparison.OrdinalIgnoreCase) &&
-                                !targetNormalizedPaths.Contains(e.NormPath))
-                                .ToList();
-                        }
-
-                        foreach (var wf in wingFiles)
-                        {
-                            AddFileWithTextures(wf.File, wf.NormPath, "Character/wing");
-                        }
-                    }
-
-                    // 4. Mascotes / Pets (Type 120)
-                    if (type == 120 && model > 0)
-                    {
-                        var petRegex = new Regex($@"_(?:0*{model})(?:_[^.]+)?\.(?:3dc|3do|dds|tga)$", RegexOptions.IgnoreCase);
-                        var petFiles = allDonorFiles.Where(e =>
-                            (e.NormPath.StartsWith("Character/Monster/", StringComparison.OrdinalIgnoreCase) ||
-                             e.NormPath.StartsWith("Character/Pet/", StringComparison.OrdinalIgnoreCase)) &&
-                            petRegex.IsMatch(e.File.Name))
-                            .ToList();
-
-                        foreach (var pf in petFiles)
-                        {
-                            AddFileWithTextures(pf.File, pf.NormPath, "Character/");
+                            selectedFiles.TryAdd(tex.NormPath, tex.File);
                         }
                     }
                 }
@@ -785,8 +742,6 @@ namespace ShaiyaItemImporter
                 {
                     if (itm.Icon > 0)
                     {
-                        // Shaiya usa Icon diretamente como número da folha (ex.: Icon=19 -> interface/icon/19.dds)
-                        // e também suporta índice linear (Icon / 256)
                         requiredSheetNumbers.Add(itm.Icon);
                         int zeroBased = itm.Icon / 256;
                         if (zeroBased > 0)
@@ -797,14 +752,7 @@ namespace ShaiyaItemImporter
                     }
                 }
 
-                var donorIconFiles = allDonorFiles
-                    .Where(e => (e.NormPath.StartsWith("interface/icon/", StringComparison.OrdinalIgnoreCase) ||
-                                 (e.NormPath.StartsWith("interface/", StringComparison.OrdinalIgnoreCase) &&
-                                  e.File.Name.Contains("icon", StringComparison.OrdinalIgnoreCase))) &&
-                                e.File.Name.EndsWith(".dds", StringComparison.OrdinalIgnoreCase))
-                    .ToList();
-
-                foreach (var iconEntry in donorIconFiles)
+                foreach (var iconEntry in allIconSheets)
                 {
                     var m = Regex.Match(iconEntry.File.Name, @"(\d+)\.dds$", RegexOptions.IgnoreCase);
                     bool isUsedSheet = m.Success && int.TryParse(m.Groups[1].Value, out int num) && requiredSheetNumbers.Contains(num);
@@ -812,12 +760,12 @@ namespace ShaiyaItemImporter
 
                     if (isUsedSheet || isMissingInTarget)
                     {
-                        collected.TryAdd(iconEntry.NormPath, iconEntry.File);
+                        selectedFiles.TryAdd(iconEntry.NormPath, iconEntry.File);
                     }
                 }
             }
 
-            return collected.Values.ToList();
+            return selectedFiles.Values.ToList();
         }
 
         private int ExtractAllRequiredAssets(
@@ -828,7 +776,7 @@ namespace ShaiyaItemImporter
             bool copyIcons,
             string patchTempDir)
         {
-            Log("Analisando modelos 3D (.3DO/.3DC), texturas (.DDS) e folhas de ícones (interface/icon/*.dds)...");
+            Log("Coletando modelos 3D, texturas e folhas de ícones por extensão...");
 
             var filesToExtract = CollectRequiredAssetFiles(donorData, targetData, selectedItems, copyAssets, copyIcons);
             int modelsCount = 0;
