@@ -30,7 +30,6 @@ namespace ShaiyaItemImporter
 
         private static readonly HashSet<byte> CashItemTypes = new() { 90, 91, 92, 93, 95, 100, 101, 102, 120, 121, 150 };
 
-        // Inclui armaduras padrão (16-27) e faixas de sets/elmos/fantasias EP6/EP8 (36-41, 51-56, 67-77, 90-93, 150)
         private static readonly HashSet<byte> ArmorAndCostumeTypes = new()
         {
             16, 17, 18, 20, 21, 22, 23, 24, 26, 27,
@@ -59,8 +58,13 @@ namespace ShaiyaItemImporter
 
         private void Log(string msg) => OnLog?.Invoke(msg);
 
-        private static string NormalizeRelPath(string path) =>
-            path.Replace('\\', '/').TrimStart('/');
+        private static string NormalizeRelPath(string path)
+        {
+            string norm = path.Replace('\\', '/').TrimStart('/');
+            if (norm.StartsWith("data/", StringComparison.OrdinalIgnoreCase))
+                norm = norm.Substring(5);
+            return norm;
+        }
 
         public async Task LoadClientsAsync(string donorSahPath, string targetSahPath, bool allowHigherTypes = false)
         {
@@ -257,11 +261,9 @@ namespace ShaiyaItemImporter
             if (string.IsNullOrWhiteSpace(name) || name.Length < 2)
                 return true;
 
-            // Filtra strings coreanas corrompidas (ex.: "???253", "? ?? ??? 6", "13 B ?? ???")
             if (name.Contains("??") || name.StartsWith("?"))
                 return true;
 
-            // Exige ao menos uma palavra válida com 2+ letras
             if (!ValidLetterRegex.IsMatch(name))
                 return true;
 
@@ -282,7 +284,6 @@ namespace ShaiyaItemImporter
             if (d.Icon == 0 && d.Model == 0)
                 return true;
 
-            // Filtra armas, armaduras, elmos e fantasias sem nenhum status ou atributo configurado
             bool isEquipment = WeaponAndShieldTypes.Contains(d.ItemType) || ArmorAndCostumeTypes.Contains(d.ItemType);
             if (isEquipment)
             {
@@ -318,13 +319,6 @@ namespace ShaiyaItemImporter
             }
         }
 
-        public int PreviewRequiredAssetsCount(List<ItemEntry> selectedItems, bool copyAssets, bool copyIcons)
-        {
-            if (DonorData == null || TargetData == null) return 0;
-            var plan = CollectRequiredAssetFiles(DonorData, TargetData, selectedItems, copyAssets, copyIcons);
-            return plan.Count;
-        }
-
         public async Task<int> ExecuteImportAsync(
             List<ItemEntry> selectedItems,
             string targetSahPath,
@@ -355,6 +349,24 @@ namespace ShaiyaItemImporter
 
                 if (dryRun)
                 {
+                    Log("[DRY-RUN] Amostra de Model/Icon dos 5 primeiros itens:");
+                    foreach (var sample in distinctItems.Take(5))
+                    {
+                        Log($"   [{sample.Type:D3}:{sample.TypeId:D3}] {sample.DonorName} -> Model={sample.Model} | Icon={sample.Icon}");
+                    }
+
+                    var sampleItemFiles = DonorData.FileIndex.Values
+                        .Select(f => NormalizeRelPath(f.RelativePath))
+                        .Where(p => p.StartsWith("Item/3DO/", StringComparison.OrdinalIgnoreCase))
+                        .Take(5);
+                    Log("[DRY-RUN] Exemplos em Item/3DO/: " + string.Join(", ", sampleItemFiles));
+
+                    var sampleInterfaceFiles = DonorData.FileIndex.Values
+                        .Select(f => NormalizeRelPath(f.RelativePath))
+                        .Where(p => p.StartsWith("Interface/", StringComparison.OrdinalIgnoreCase) && p.EndsWith(".dds", StringComparison.OrdinalIgnoreCase))
+                        .Take(8);
+                    Log("[DRY-RUN] Exemplos em Interface/: " + string.Join(", ", sampleInterfaceFiles));
+
                     var previewFiles = CollectRequiredAssetFiles(DonorData, TargetData, distinctItems, copyAssets, copyIcons);
                     int modelsCount = previewFiles.Count(f => f.Name.EndsWith(".3do", StringComparison.OrdinalIgnoreCase) || f.Name.EndsWith(".3dc", StringComparison.OrdinalIgnoreCase));
                     int iconsCount = previewFiles.Count(f => NormalizeRelPath(f.RelativePath).StartsWith("Interface/", StringComparison.OrdinalIgnoreCase));
@@ -654,17 +666,16 @@ namespace ShaiyaItemImporter
                     int model = itm.Model;
                     byte type = itm.Type;
 
-                    // 1. Armas, escudos e itens em Item/3DO e Item/DDS
+                    // 1. Armas, escudos e itens em Item/3DO e Item/DDS (suporta 01_145, 01_0145, etc.)
                     if (WeaponAndShieldTypes.Contains(type) || (!ArmorAndCostumeTypes.Contains(type) && type != 120 && type != 121 && model > 0))
                     {
-                        string modelPrefix3 = $"{type:D2}_{model:D3}";
-                        string modelPrefix2 = $"{type:D2}_{model:D2}";
+                        var itemAssetRegex = new Regex(
+                            $@"^(?:[a-z]+_)?(?:0*{type})_(?:0*{model})(?:_[^.]+)?\.(?:3do|3dc|dds|tga)$",
+                            RegexOptions.IgnoreCase);
 
                         var weaponModels = allDonorFiles.Where(e =>
                             e.NormPath.StartsWith("Item/3DO/", StringComparison.OrdinalIgnoreCase) &&
-                            (e.File.Name.StartsWith(modelPrefix3, StringComparison.OrdinalIgnoreCase) ||
-                             (model < 100 && e.File.Name.StartsWith(modelPrefix2 + ".", StringComparison.OrdinalIgnoreCase)) ||
-                             (model < 100 && e.File.Name.StartsWith(modelPrefix2 + "_", StringComparison.OrdinalIgnoreCase))))
+                            itemAssetRegex.IsMatch(e.File.Name))
                             .ToList();
 
                         foreach (var wm in weaponModels)
@@ -675,9 +686,7 @@ namespace ShaiyaItemImporter
                         var weaponTextures = allDonorFiles.Where(e =>
                             (e.NormPath.StartsWith("Item/DDS/", StringComparison.OrdinalIgnoreCase) ||
                              e.NormPath.StartsWith("Item/Texture/", StringComparison.OrdinalIgnoreCase)) &&
-                            (e.File.Name.StartsWith(modelPrefix3, StringComparison.OrdinalIgnoreCase) ||
-                             (model < 100 && e.File.Name.StartsWith(modelPrefix2 + ".", StringComparison.OrdinalIgnoreCase)) ||
-                             (model < 100 && e.File.Name.StartsWith(modelPrefix2 + "_", StringComparison.OrdinalIgnoreCase))))
+                            itemAssetRegex.IsMatch(e.File.Name))
                             .ToList();
 
                         foreach (var wt in weaponTextures)
@@ -716,13 +725,14 @@ namespace ShaiyaItemImporter
                             AddFileWithTextures(at.File, at.NormPath);
                         }
 
-                        // Fallback para elmos/capas armazenados em Item/3DO/{type:D2}_{model:D3}
                         if (armorMeshes.Count == 0)
                         {
-                            string prefix3 = $"{type:D2}_{model:D3}";
+                            var helmItemRegex = new Regex(
+                                $@"^(?:[a-z]+_)?(?:0*{type})_(?:0*{model})(?:_[^.]+)?\.(?:3do|3dc|dds|tga)$",
+                                RegexOptions.IgnoreCase);
                             foreach (var hm in allDonorFiles.Where(e =>
-                                e.NormPath.StartsWith("Item/3DO/", StringComparison.OrdinalIgnoreCase) &&
-                                e.File.Name.StartsWith(prefix3, StringComparison.OrdinalIgnoreCase)))
+                                e.NormPath.StartsWith("Item/", StringComparison.OrdinalIgnoreCase) &&
+                                helmItemRegex.IsMatch(e.File.Name)))
                             {
                                 AddFileWithTextures(hm.File, hm.NormPath, "Item/");
                             }
@@ -788,8 +798,7 @@ namespace ShaiyaItemImporter
 
                 var donorIconFiles = allDonorFiles
                     .Where(e => e.NormPath.StartsWith("Interface/", StringComparison.OrdinalIgnoreCase) &&
-                                (e.File.Name.StartsWith("ItemIcon", StringComparison.OrdinalIgnoreCase) ||
-                                 e.File.Name.StartsWith("item_icon", StringComparison.OrdinalIgnoreCase)) &&
+                                e.File.Name.Contains("icon", StringComparison.OrdinalIgnoreCase) &&
                                 e.File.Name.EndsWith(".dds", StringComparison.OrdinalIgnoreCase))
                     .ToList();
 
@@ -817,7 +826,7 @@ namespace ShaiyaItemImporter
             bool copyIcons,
             string patchTempDir)
         {
-            Log("Analisando modelos 3D (.3DO/.3DC), texturas (.DDS) e folhas de ícones (ItemIcon*.dds)...");
+            Log("Analisando modelos 3D (.3DO/.3DC), texturas (.DDS) e folhas de ícones (Interface/*icon*.dds)...");
 
             var filesToExtract = CollectRequiredAssetFiles(donorData, targetData, selectedItems, copyAssets, copyIcons);
             int modelsCount = 0;
